@@ -1,11 +1,17 @@
-from doctest import testfile
-from unicodedata import name
+'''
+IMPORTANT
+patch lsl_client.py ._connect()
+    ids.append(stream_info.type())
+
+to make it work with NeoRec
+'''
+
 import mne
 import mne_realtime
 import pathlib
 from pythonosc import udp_client
 import numpy as np 
-import threading
+import json
 import multiprocessing
 import copy
 import time
@@ -19,7 +25,11 @@ mne.set_log_level(verbose="ERROR")
 class conf:
     scaler = 1e6
     osc_ip = "127.0.0.1"
+    osc_ip_td = "127.0.0.1"
+    
     port = 9090
+    port_td = 9094
+
     osc_address = "/"
     lsl_host = "Data" # not host
     lsl_fakehost = "EEG"
@@ -33,7 +43,7 @@ class conf:
                          'beta':[14,20],
                         'gamma':[21,33]}
 
-    test_file_name = 'test_file.txt'
+    test_file_name = 'test_file.json'
 
 def check_data_loaded(func):
     # raise something besides StopIteration IF LSL STREAM STOPPED
@@ -54,7 +64,14 @@ class EEG:
         self.ns.eeg_nsamp = 0
     
     def read_eeg_file(self, filename:pathlib.Path):
-        self.raw = self.read_xdf_file(filename=filename)
+        print(filename, filename.suffix)
+        if filename.suffix in ['.edf', '.bdf']:
+            self.raw = self.read_xdf_file(filename=filename)
+        elif filename.suffix == '.vhdr':
+            self.raw = mne.io.read_raw_brainvision(vhdr_fname=filename)
+        else:
+            raise NotImplementedError
+
     
     def read_xdf_file(self, filename:pathlib.Path=None):
         print(filename.suffix)
@@ -117,8 +134,9 @@ class EEG:
 
 
 class OSCStreamer():
-    def __init__(self, namespace) -> None:
+    def __init__(self, namespace, i=0) -> None:
         self.ns = namespace
+        self.i = i
     
     def create_osc_stream(self, ip:str="127.0.0.1", port:int=8090) ->None:
         print(f'connecting to OSC at {ip}:{port}')
@@ -131,23 +149,25 @@ class OSCStreamer():
             pass
         print('processing thread initialised')
 
-        while not self.ns.payload_ready:
-            time.sleep(0.5)
-        print('first payload is ready to stream')
+        while not self.ns.payload_ready[self.i]:
+            time.sleep(0.1)
+        print('first payload is ready to stream - streamer {self.i}')
         while 1:
             # if 
-            if self.ns.payload_ready:
+            if self.ns.payload_ready[self.i]:
+                plr = self.ns.payload_ready
                 pl = copy.deepcopy(self.ns.payload)
                 for key, value in pl.items():
                     self.client.send_message(conf.osc_address + key, value)
-                self.ns.payload_ready=False
-                time.sleep(0.5)
+                plr[self.i] = False
+                self.ns.payload_ready = plr
+                time.sleep(0.1)
 
 class Processor(): #  transformer mixin?
     def __init__(self, namespace) -> None:
         self.ns = namespace
         self.nsamp = None
-        self.ns.payload_ready = False
+        self.ns.payload_ready = {1:False, 0:False}
     
     def realtime_filter(self):
         pass
@@ -191,7 +211,7 @@ class Processor(): #  transformer mixin?
                 payload[f"{band}_{n_+1}"] = feature_value[n_]
                 payload[f"eeg_{n_}"] = self.ns.window[n_,:]
         self.ns.payload = payload
-        self.ns.payload_ready = True
+        self.ns.payload_ready = {0:True, 1:True}
 
 class Plotter_pyqtgraph():
     def __init__(self, namespace):
@@ -235,10 +255,11 @@ def do_eeg(namespace, fake = False):
     eeg = EEG(namespace, fake=fake)
 
     print ('EEG thread started')
-    with open(conf.test_file_name, 'r') as f:
-        test_file_name = f.read()
+
     if fake:
-        eeg.read_eeg_file(pathlib.Path(test_file_name))
+        with open(conf.test_file_name, 'r') as f:
+            test_file = json.loads(f.read())['test_file']
+        eeg.read_eeg_file(pathlib.Path(test_file))
         eeg.connect_to_stream(raw_start_time=60*5.5)
     eeg.create_client()
     eeg.get_eeg_data()
@@ -247,11 +268,10 @@ def do_processing(namespace):
     processor = Processor(namespace)
     processor.get_window_eeg()
 
-def do_osc_streaming(namespace):
-    streamer = OSCStreamer(namespace)
-    streamer.create_osc_stream(ip=conf.osc_ip, port=conf.port)
+def do_osc_streaming(namespace, i=0, ip=conf.osc_ip, port=conf.port):
+    streamer = OSCStreamer(namespace, i)
+    streamer.create_osc_stream(ip, port)
     streamer.stream_to_osc()
-
 
 def do_gui(namespace):
     app = QtGui.QApplication([])
@@ -275,12 +295,17 @@ if __name__ == "__main__":
     
     th3 = multiprocessing.Process(target=do_osc_streaming, args = (namespace,))
     th3.start()
+
+    th4 = multiprocessing.Process(target=do_osc_streaming, args = (namespace, 1, conf.osc_ip_td, conf.port_td))
+    th4.start()
     
     # th4 = multiprocessing.Process(target=do_gui, args = (namespace,))
     # th4.start()
     th1.join()
     th2.join()
     th3.join()
+    th4.join()
+
 
     # do_gui(namespace)
 
