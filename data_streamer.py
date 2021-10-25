@@ -1,4 +1,5 @@
 from doctest import testfile
+from unicodedata import name
 import mne
 import mne_realtime
 import pathlib
@@ -17,13 +18,16 @@ mne.set_log_level(verbose="ERROR")
 
 class conf:
     scaler = 1e6
-    ip = "127.0.0.1"
+    osc_ip = "127.0.0.1"
     port = 9090
     osc_address = "/"
-    lsl_host = "127.0.0.1"
+    lsl_host = "Data" # not host
+    lsl_fakehost = "EEG"
     pull_n_samples = 251
     spectral_analyis_window = 1000
     n_minutes_buffer = 0.5
+    
+    info = mne.create_info(['Cz', 'C3', 'C4', 'P3', 'Pz', 'P4', 'PO3'], 1000, ch_types='eeg')
 
     frequency_bands = {'alpha':[8,12],
                          'beta':[14,20],
@@ -42,14 +46,15 @@ def check_data_loaded(func):
     return wrapper
 
 class EEG:
-    def __init__(self):
+    def __init__(self, namespace, fake):
+        self.ns = namespace
         self.raw = None
+        self.fake = fake
         self.data_buffer = np.empty(0)
-        self.nsamp = 0
+        self.ns.eeg_nsamp = 0
     
     def read_eeg_file(self, filename:pathlib.Path):
         self.raw = self.read_xdf_file(filename=filename)
-        self.raw._data *= conf.scaler # fix for different units
     
     def read_xdf_file(self, filename:pathlib.Path=None):
         print(filename.suffix)
@@ -63,16 +68,20 @@ class EEG:
             self.stream = mne_realtime.MockLSLStream(raw=self.raw.crop(raw_start_time), host=conf.lsl_host, ch_type="eeg")
             self.stream.start()
         else:
-            raise NotImplementedError
+            pass
     
     def create_client(self):
-        self.client = mne_realtime.LSLClient(host=conf.lsl_host, buffer_size = 100)
+        if self.fake:
+            self.client = mne_realtime.LSLClient(host=conf.lsl_fakehost, buffer_size = 100)
+        else:
+            self.client = mne_realtime.LSLClient(conf.info, host=conf.lsl_host, buffer_size = 100)
         self.client.start()
 
     def get_eeg_data(self):
         
-        epoch = self.client.get_data_as_epoch(n_samples=conf.pull_n_samples) # get info
-        self.info = epoch.info
+        epoch = self.client.get_data_as_epoch(n_samples=conf.pull_n_samples) # get info # fix for different units
+
+        self.ns.info = epoch.info
         self.create_ring_buffer()
 
         for a in self.client.iter_raw_buffers(): #get raw data
@@ -80,29 +89,36 @@ class EEG:
                 self.add_to_buffer(a)
 
     def create_ring_buffer(self):
-        self.ring_buffer = np.zeros((self.info['nchan'], int(self.info['sfreq']*60*conf.n_minutes_buffer)))*np.nan
-        self.nsamp = 0
-        self.global_nsamp = 0
+        self.ns.ring_buffer = np.zeros((self.ns.info['nchan'], int(self.ns.info['sfreq']*60*conf.n_minutes_buffer)))*np.nan
+        self.ring_buffer = np.zeros((self.ns.info['nchan'], int(self.ns.info['sfreq']*60*conf.n_minutes_buffer)))*np.nan
+
+        self.ns.eeg_nsamp = 0
+        self.ns.global_nsamp = 0
 
         print(f"created ring buffer {self.ring_buffer.shape}")
     
     def add_to_buffer(self, data):
-        self.nsamp += data.shape[-1]
-        self.global_nsamp += data.shape[-1]
-        if self.nsamp > self.ring_buffer.shape[-1]:
+        data *= conf.scaler
+        nsamp = self.ns.eeg_nsamp + data.shape[-1]
+        if nsamp> self.ring_buffer.shape[-1]:
             transfer_data_to_new_buffer = copy.deepcopy(self.ring_buffer[:,-1*conf.spectral_analyis_window*2:])
             transfer_data_to_new_buffer = transfer_data_to_new_buffer[:,~np.isnan(transfer_data_to_new_buffer[0,:])]
 
-            self.ring_buffer*=np.nan
-            self.nsamp = 0
+            self.ring_buffer = self.ring_buffer*np.nan
+            nsamp = 0
             self.add_to_buffer(transfer_data_to_new_buffer)
             print('updated buffer')
         else:
-            self.ring_buffer[:,self.nsamp - data.shape[1]:self.nsamp] = data
+            self.ring_buffer[:,nsamp - data.shape[1]:nsamp] = data
+            self.ns.ring_buffer = self.ring_buffer
+
+        self.ns.eeg_nsamp = nsamp
+        self.ns.global_nsamp += data.shape[-1]
+
 
 class OSCStreamer():
-    def __init__(self) -> None:
-        pass
+    def __init__(self, namespace) -> None:
+        self.ns = namespace
     
     def create_osc_stream(self, ip:str="127.0.0.1", port:int=8090) ->None:
         print(f'connecting to OSC at {ip}:{port}')
@@ -110,41 +126,47 @@ class OSCStreamer():
         print(f'connected to OSC at {ip}:{port}')
 
 
-    def stream_to_osc(self, processor):
-        while not processor.payload_ready:
+    def stream_to_osc(self):
+        while not hasattr(self.ns, 'payload_ready'):
             pass
+        print('processing thread initialised')
+
+        while not self.ns.payload_ready:
+            time.sleep(0.5)
+        print('first payload is ready to stream')
         while 1:
             # if 
-            if processor.payload_ready:
-                pl = copy.deepcopy(processor.payload)
+            if self.ns.payload_ready:
+                pl = copy.deepcopy(self.ns.payload)
                 for key, value in pl.items():
                     self.client.send_message(conf.osc_address + key, value)
-                processor.payload_ready=False
+                self.ns.payload_ready=False
                 time.sleep(0.5)
 
 class Processor(): #  transformer mixin?
-    def __init__(self, eeg:EEG) -> None:
-        self.eeg = eeg
+    def __init__(self, namespace) -> None:
+        self.ns = namespace
         self.nsamp = None
-        self.payload_ready = False
+        self.ns.payload_ready = False
     
     def realtime_filter(self):
         pass
     
     def get_window_eeg(self):
         print ('Processing thread started')
-        while not hasattr(self.eeg, 'info'):
+        while not hasattr(self.ns, 'info'):
             pass
-        flt = signal.butter(4, [1, 30], btype = 'bandpass',fs = self.eeg.info['sfreq'])
+        flt = signal.butter(4, [1, 30], btype = 'bandpass',fs = self.ns.info['sfreq'])
         while 1:
             time.sleep(0.1)
-            if self.nsamp != self.eeg.nsamp:
-                self.nsamp = self.eeg.nsamp
+
+            if self.nsamp != self.ns.eeg_nsamp:
+                self.nsamp = self.ns.eeg_nsamp
                 start_window = self.nsamp - conf.spectral_analyis_window
 
                 if start_window > 0:
-                    window = self.eeg.ring_buffer[:, start_window:self.nsamp]
-                    self.window = signal.filtfilt(*flt, window)
+                    window = self.ns.ring_buffer[:, start_window:self.nsamp]
+                    self.ns.window = signal.filtfilt(*flt, window)
                     self.realtime_welch(channel=0)
                     self.transform_eeg_to_osc_features()
                     # print(self.eeg.ring_buffer.shape, start_window, self.nsamp)
@@ -153,36 +175,36 @@ class Processor(): #  transformer mixin?
         # self.spectrum = signal.welch(self.window[channel,:], fs=self.eeg.info['sfreq'], window='hann', nperseg=None, noverlap=None, nfft=None, detrend='constant', return_onesided=True, scaling='density', axis=- 1, average='mean')
         # print(self.spectrum)
         # print(self.window.shape)
-        self.spectrum = mne.time_frequency.psd_array_welch(self.window, sfreq = self.eeg.info['sfreq'], fmin=1, fmax=35)
-
+        # print(self.ns.window)
+        self.ns.spectrum = mne.time_frequency.psd_array_welch(self.ns.window, sfreq = self.ns.info['sfreq'], fmin=1, fmax=35)
 
     def transform_eeg_to_osc_features(self):
-        self.payload = {}
+        payload = {}
 
         for band in conf.frequency_bands:
             bandstart = conf.frequency_bands[band][0]
             bandend = conf.frequency_bands[band][1]
 
-            msk = np.ma.masked_where(np.logical_and(self.spectrum[1]>=bandstart, self.spectrum[1]<bandend), self.spectrum[1])
-            feature_value = np.average(self.spectrum[0][:,msk.mask], axis=1)
-            for n_, channel in enumerate(feature_value):
-                self.payload[f"{band}_{n_+1}"] = feature_value[n_]
-        self.payload_ready = True
-    def fit(self):
-        pass
-    
-    def transform(self):
-        pass
+            msk = np.ma.masked_where(np.logical_and(self.ns.spectrum[1]>=bandstart, self.ns.spectrum[1]<bandend), self.ns.spectrum[1])
+            feature_value = np.average(self.ns.spectrum[0][:,msk.mask], axis=1)
+            for n_, value in enumerate(feature_value):
+                payload[f"{band}_{n_+1}"] = feature_value[n_]
+                payload[f"eeg_{n_}"] = self.ns.window[n_,:]
+        self.ns.payload = payload
+        self.ns.payload_ready = True
 
 class Plotter_pyqtgraph():
-    def __init__(self, eeg):
-        while not hasattr(eeg, 'ring_buffer'):
+    def __init__(self, namespace):
+        self.ns = namespace
+        print("starting plotter")
+        
+        while not hasattr(self.ns, 'ring_buffer'):
             pass
         
         self.win = pg.GraphicsWindow(title="Signal") # creates a window
         self.eeg_plots = {}
         self.spectrum_plots = {}
-        for channel in range(eeg.ring_buffer.shape[0]):
+        for channel in range(self.ns.ring_buffer.shape[0]):
 
             p = self.win.addPlot(row=channel, col=0, title="Realtime plot")
             p2 = self.win.addPlot(row=channel, col=1, title="Spectum plot")  # creates empty space for the plot in the window
@@ -193,55 +215,74 @@ class Plotter_pyqtgraph():
         
     def update(self, data, data2, x):
         # print(data.shape, data2.shape)
-        for channel in range(eeg.ring_buffer.shape[0]):
+        for channel in range(self.ns.ring_buffer.shape[0]):
             # print(channel)
             self.eeg_plots[channel].setData(x, data[channel,:])                     # set the curve with this data
             # self.curve.setPos(self.ptr,0)                   # set x position in the graph to 0
             self.spectrum_plots[channel].setData(data2[1], data2[0][channel]) 
         time.sleep(0.1)
     
-    def run(self, processor):
-        print ('Plotter thread started')
+    def run(self):
 
-        while not hasattr(processor, 'window') or not hasattr(processor, 'spectrum'):
+        while not hasattr(self.ns, 'spectrum'):
             pass
+        
         while 1:
-            x = [(processor.eeg.global_nsamp+n)/processor.eeg.info['sfreq'] for n in range(len(processor.window[0,:]))]
-            self.update(processor.window, processor.spectrum, x)
-            
+            x = [(self.ns.global_nsamp+n)/self.ns.info['sfreq'] for n in range(len(self.ns.window[0,:]))]
+            self.update(self.ns.window, self.ns.spectrum, x)
 
-def do_eeg(eeg:EEG):
+def do_eeg(namespace, fake = False):
+    eeg = EEG(namespace, fake=fake)
+
     print ('EEG thread started')
     with open(conf.test_file_name, 'r') as f:
         test_file_name = f.read()
-    eeg.read_eeg_file(pathlib.Path(test_file_name))
-    eeg.connect_to_stream(raw_start_time=60*5.5)
+    if fake:
+        eeg.read_eeg_file(pathlib.Path(test_file_name))
+        eeg.connect_to_stream(raw_start_time=60*5.5)
     eeg.create_client()
     eeg.get_eeg_data()
 
-if __name__ == "__main__":
+def do_processing(namespace):
+    processor = Processor(namespace)
+    processor.get_window_eeg()
+
+def do_osc_streaming(namespace):
+    streamer = OSCStreamer(namespace)
+    streamer.create_osc_stream(ip=conf.osc_ip, port=conf.port)
+    streamer.stream_to_osc()
+
+
+def do_gui(namespace):
     app = QtGui.QApplication([])
+    plotter = Plotter_pyqtgraph(namespace)
+    plotter.run()
+    pg.QtGui.QApplication.exec_() # you MUST put this at the end
+
+    
+if __name__ == "__main__":
+
     
     mgr = multiprocessing.Manager()
     namespace = mgr.Namespace()
+    # do_gui(namespace)
+
+    th1 = multiprocessing.Process(target=do_eeg, args = (namespace, True))
+    th1.start()
     
-    eeg = EEG()
-    th = threading.Thread(target=do_eeg, args = (eeg,))
-    th.start()
-    
-    processor = Processor(eeg)
-    th2 = threading.Thread(target=processor.get_window_eeg)
+    th2 = multiprocessing.Process(target=do_processing, args = (namespace,))
     th2.start()
     
-    plotter = Plotter_pyqtgraph(eeg)
-    th3 = threading.Thread(target=plotter.run, args = (processor,))
+    th3 = multiprocessing.Process(target=do_osc_streaming, args = (namespace,))
     th3.start()
-
-
-    # streamer = OSCStreamer()
-    # streamer.create_osc_stream(ip=conf.ip, port=conf.port)
-    # streamer.stream_to_osc(processor)
-
-
-    pg.QtGui.QApplication.exec_() # you MUST put this at the end
     
+    # th4 = multiprocessing.Process(target=do_gui, args = (namespace,))
+    # th4.start()
+    th1.join()
+    th2.join()
+    th3.join()
+
+    # do_gui(namespace)
+
+    # th4.join()
+
