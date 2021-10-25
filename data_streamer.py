@@ -12,6 +12,7 @@ import pathlib
 from pythonosc import udp_client
 import numpy as np 
 import json
+import pickle
 import multiprocessing
 import copy
 import time
@@ -35,6 +36,7 @@ class conf:
     lsl_fakehost = "EEG"
     pull_n_samples = 251
     spectral_analyis_window = 1000
+    downsample_div = 10
     n_minutes_buffer = 0.5
     
     info = mne.create_info(['Cz', 'C3', 'C4', 'P3', 'Pz', 'P4', 'PO3'], 1000, ch_types='eeg')
@@ -72,7 +74,6 @@ class EEG:
         else:
             raise NotImplementedError
 
-    
     def read_xdf_file(self, filename:pathlib.Path=None):
         print(filename.suffix)
         if filename.suffix == '.bdf':
@@ -143,7 +144,6 @@ class OSCStreamer():
         self.client = udp_client.SimpleUDPClient(ip, port)
         print(f'connected to OSC at {ip}:{port}')
 
-
     def stream_to_osc(self):
         while not hasattr(self.ns, 'payload_ready'):
             pass
@@ -151,14 +151,16 @@ class OSCStreamer():
 
         while not self.ns.payload_ready[self.i]:
             time.sleep(0.1)
-        print('first payload is ready to stream - streamer {self.i}')
+        print(f'first payload is ready to stream - streamer {self.i}')
         while 1:
             # if 
             if self.ns.payload_ready[self.i]:
                 plr = self.ns.payload_ready
                 pl = copy.deepcopy(self.ns.payload)
+
                 for key, value in pl.items():
                     self.client.send_message(conf.osc_address + key, value)
+                    time.sleep(.01)
                 plr[self.i] = False
                 self.ns.payload_ready = plr
                 time.sleep(0.1)
@@ -199,6 +201,7 @@ class Processor(): #  transformer mixin?
         self.ns.spectrum = mne.time_frequency.psd_array_welch(self.ns.window, sfreq = self.ns.info['sfreq'], fmin=1, fmax=35)
 
     def transform_eeg_to_osc_features(self):
+        #unfuck the cycle
         payload = {}
 
         for band in conf.frequency_bands:
@@ -209,47 +212,13 @@ class Processor(): #  transformer mixin?
             feature_value = np.average(self.ns.spectrum[0][:,msk.mask], axis=1)
             for n_, value in enumerate(feature_value):
                 payload[f"{band}_{n_+1}"] = feature_value[n_]
-                payload[f"eeg_{n_}"] = self.ns.window[n_,:]
+        
+                payload[f"eeg_{n_}"] = signal.decimate(self.ns.window[n_,:], conf.downsample_div).tolist()
+        for band in conf.frequency_bands:
+            payload[f"average_{band}"] = np.average([payload[a] for a in payload.keys() if band in a])
         self.ns.payload = payload
         self.ns.payload_ready = {0:True, 1:True}
 
-class Plotter_pyqtgraph():
-    def __init__(self, namespace):
-        self.ns = namespace
-        print("starting plotter")
-        
-        while not hasattr(self.ns, 'ring_buffer'):
-            pass
-        
-        self.win = pg.GraphicsWindow(title="Signal") # creates a window
-        self.eeg_plots = {}
-        self.spectrum_plots = {}
-        for channel in range(self.ns.ring_buffer.shape[0]):
-
-            p = self.win.addPlot(row=channel, col=0, title="Realtime plot")
-            p2 = self.win.addPlot(row=channel, col=1, title="Spectum plot")  # creates empty space for the plot in the window
-            self.eeg_plots[channel] = p.plot()                        # create an empty "plot" (a curve to plot)
-            self.spectrum_plots[channel] = p2.plot()                        # create an empty "plot" (a curve to plot)
-
-        QtGui.QApplication.processEvents()
-        
-    def update(self, data, data2, x):
-        # print(data.shape, data2.shape)
-        for channel in range(self.ns.ring_buffer.shape[0]):
-            # print(channel)
-            self.eeg_plots[channel].setData(x, data[channel,:])                     # set the curve with this data
-            # self.curve.setPos(self.ptr,0)                   # set x position in the graph to 0
-            self.spectrum_plots[channel].setData(data2[1], data2[0][channel]) 
-        time.sleep(0.1)
-    
-    def run(self):
-
-        while not hasattr(self.ns, 'spectrum'):
-            pass
-        
-        while 1:
-            x = [(self.ns.global_nsamp+n)/self.ns.info['sfreq'] for n in range(len(self.ns.window[0,:]))]
-            self.update(self.ns.window, self.ns.spectrum, x)
 
 def do_eeg(namespace, fake = False):
     eeg = EEG(namespace, fake=fake)
@@ -268,16 +237,10 @@ def do_processing(namespace):
     processor = Processor(namespace)
     processor.get_window_eeg()
 
-def do_osc_streaming(namespace, i=0, ip=conf.osc_ip, port=conf.port):
+def do_osc_streaming(namespace, i=0, ip=conf.osc_ip, port=conf.port, ):
     streamer = OSCStreamer(namespace, i)
     streamer.create_osc_stream(ip, port)
     streamer.stream_to_osc()
-
-def do_gui(namespace):
-    app = QtGui.QApplication([])
-    plotter = Plotter_pyqtgraph(namespace)
-    plotter.run()
-    pg.QtGui.QApplication.exec_() # you MUST put this at the end
 
     
 if __name__ == "__main__":
@@ -296,7 +259,7 @@ if __name__ == "__main__":
     th3 = multiprocessing.Process(target=do_osc_streaming, args = (namespace,))
     th3.start()
 
-    th4 = multiprocessing.Process(target=do_osc_streaming, args = (namespace, 1, conf.osc_ip_td, conf.port_td))
+    th4 = multiprocessing.Process(target=do_osc_streaming, args = (namespace, 1, conf.osc_ip_td, conf.port_td, True))
     th4.start()
     
     # th4 = multiprocessing.Process(target=do_gui, args = (namespace,))
