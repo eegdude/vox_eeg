@@ -16,8 +16,6 @@ import pickle
 import multiprocessing
 import copy
 import time
-from pyqtgraph.Qt import QtGui, QtCore
-import pyqtgraph as pg
 from scipy import signal
 import copy
 
@@ -259,7 +257,7 @@ if __name__ == "__main__":
     th3 = multiprocessing.Process(target=do_osc_streaming, args = (namespace,))
     th3.start()
 
-    th4 = multiprocessing.Process(target=do_osc_streaming, args = (namespace, 1, conf.osc_ip_td, conf.port_td, True))
+    th4 = multiprocessing.Process(target=do_osc_streaming, args = (namespace, 1, conf.osc_ip_td, conf.port_td))
     th4.start()
     
     # th4 = multiprocessing.Process(target=do_gui, args = (namespace,))
