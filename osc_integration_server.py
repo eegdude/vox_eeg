@@ -10,7 +10,9 @@ import threading
 class conf:
     osc_ip_max = "127.0.0.1"
     osc_ip_td = "127.0.0.1"
-    host_integrator = "127.0.0.1"
+    # host_integrator = "2.0.0.151"
+    host_integrator = "2.0.0.151"
+
     
     port_max = 9090
     port_td = 9094
@@ -29,7 +31,7 @@ class OSCServer():
     async def handle_client(self, reader, writer):
         request = None
         while request != 'quit':
-            request = (await reader.read(int(1e6)))
+            request = (await reader.readuntil(separator=b'\n'*20))
             try:
                 self.payload_buffer.append(pickle.loads(request))
                 self.stream_to_osc()
@@ -39,7 +41,7 @@ class OSCServer():
         writer.close()
 
     async def run_server(self):
-        server = await asyncio.start_server(self.handle_client, 'localhost', conf.port_integrator)
+        server = await asyncio.start_server(self.handle_client, conf.host_integrator, conf.port_integrator)
         async with server:
             await server.serve_forever()
     
@@ -59,7 +61,7 @@ class OSCServer():
             time.sleep(0.1)
     
 
-srv = OSCServer(ip_osc=conf.osc_ip_max, port_osc=conf.port_max)
+srv = OSCServer(ip_osc=conf.osc_ip_max, port_osc=conf.port_td)
 
 th1 = threading.Thread(target=asyncio.run(srv.run_server()))
 th1.start()

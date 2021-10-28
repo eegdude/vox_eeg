@@ -25,7 +25,7 @@ class conf:
     scaler = 1e6
     osc_ip_max = "127.0.0.1"
     osc_ip_td = "127.0.0.1"
-    host_integrator = "127.0.0.1"
+    host_integrator = "2.0.0.151"
     
     lsl_host = "NE-ENOBIO20 (00:07:80:64:EB:62)" # not host
     lsl_port = 16575
@@ -228,7 +228,7 @@ class AsyncClient():
                 message = self.ns.payloads[0]
                 self.ns.payloads = self.ns.payloads[1:]
 
-                self.writer.write(pickle.dumps(message))
+                self.writer.write(pickle.dumps(message) + b"\n"*20)
                 await self.writer.drain()
 
 def do_eeg(namespace, fake = False):
@@ -248,7 +248,7 @@ def do_eeg(namespace, fake = False):
 def do_processing(namespace):
     processor = Processor(namespace)
     processor.get_window_eeg()
-5
+
 def push_data(namespace, host, port):
     pusher = AsyncClient(namespace, host, port)
     asyncio.run(pusher.run())
