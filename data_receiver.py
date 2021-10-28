@@ -5,11 +5,11 @@ patch lsl_client.py ._connect()
 
 to make it work with NeoRec
 '''
-
+import asyncio
+from email import message
 import mne
 import mne_realtime
 import pathlib
-from pythonosc import udp_client
 import numpy as np 
 import json
 import pickle
@@ -25,14 +25,18 @@ class conf:
     scaler = 1e6
     osc_ip_max = "127.0.0.1"
     osc_ip_td = "127.0.0.1"
+    host_integrator = "127.0.0.1"
     
-    port_max = 9090
-    port_td = 9094
-
-    osc_address = "/"
     lsl_host = "NE-ENOBIO20 (00:07:80:64:EB:62)" # not host
     lsl_port = 16575
     lsl_fakehost = "EEG"
+
+    port_max = 9090
+    port_td = 9094
+    port_integrator = 8084
+
+
+    osc_address = "/"
     pull_n_samples = 251
     spectral_analyis_window = 1000
     downsample_div = 10
@@ -89,7 +93,7 @@ class EEG:
     
     def create_client(self):
         if self.fake:
-            self.client = mne_realtime.LSLClient(host=conf.lsl_fakehost, buffer_size = 100)
+            self.client = mne_realtime.LSLClient(host=conf.lsl_host, buffer_size = 100)
         else:
             self.client = mne_realtime.LSLClient(conf.info, host=conf.lsl_host, buffer_size = 100)
         self.client.start()
@@ -101,9 +105,9 @@ class EEG:
         self.ns.info = epoch.info
         self.create_ring_buffer()
 
-        for a in self.client.iter_raw_buffers_with_ts(): #get raw data
-            self.ns.t = a[1]
-            a = a[0]
+        for a in self.client.iter_raw_buffers(): #get raw data
+            # self.ns.t = a[1]
+            # a = a[0]
 
             if a.size:
                 self.add_to_buffer(a)
@@ -135,38 +139,6 @@ class EEG:
         self.ns.eeg_nsamp = nsamp
         self.ns.global_nsamp += data.shape[-1]
 
-
-class OSCStreamer():
-    def __init__(self, namespace, i=0) -> None:
-        self.ns = namespace
-        self.i = i
-    
-    def create_osc_stream(self, ip:str="127.0.0.1", port:int=8090) ->None:
-        print(f'connecting to OSC at {ip}:{port}')
-        self.client = udp_client.SimpleUDPClient(ip, port)
-        print(f'connected to OSC at {ip}:{port}')
-
-    def stream_to_osc(self):
-        while not hasattr(self.ns, 'payload_ready'):
-            pass
-        print('processing thread initialised')
-
-        # while not self.ns.payload_ready[self.i]:
-        #     time.sleep(0.1)
-        print(f'first payload is ready to stream - streamer {self.i}')
-        while 1:
-            # if 
-            print (self.ns.payloads)
-            if self.ns.payload_ready[self.i]:
-                plr = self.ns.payload_ready
-                pl = copy.deepcopy(self.ns.payload)
-                for key, value in pl.items():
-                    self.client.send_message(conf.osc_address + key, value)
-                    time.sleep(.01)
-                print(f"{time.time()} sent")
-                plr[self.i] = False
-                self.ns.payload_reads = plr
-                time.sleep(0.1)
 
 class Processor(): #  transformer mixin?
     def __init__(self, namespace) -> None:
@@ -223,9 +195,41 @@ class Processor(): #  transformer mixin?
 
         for band in conf.frequency_bands:
             payload[f"average_{band}"] = np.average([payload[a] for a in payload.keys() if band in a])
-        self.ns.payloads.append(payload)
+        self.ns.payloads = self.ns.payloads + [(payload)]
         # self.ns.payload_ready = {0:True, 1:True}
 
+
+
+class AsyncClient():
+
+    def __init__(self, namespace, host, port):
+        self.host= host
+        self.port = port
+        self.ns = namespace
+        
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        asyncio.run(self.create())
+        asyncio.run(self.run())
+
+    async def create(self):
+        self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
+
+
+    def writable(self):
+        if hasattr(self.ns, 'payloads'):
+            if len(self.ns.payloads) > 0:
+                return True
+        return False
+    
+    async def run(self):
+        while 1:
+            if self.writable():
+                print ("writeable")
+                message = self.ns.payloads[0]
+                self.ns.payloads = self.ns.payloads[1:]
+
+                self.writer.write(pickle.dumps(message))
+                await self.writer.drain()
 
 def do_eeg(namespace, fake = False):
     eeg = EEG(namespace, fake=fake)
@@ -240,15 +244,14 @@ def do_eeg(namespace, fake = False):
     eeg.create_client()
     eeg.get_eeg_data()
 
+
 def do_processing(namespace):
     processor = Processor(namespace)
     processor.get_window_eeg()
-
-def do_osc_streaming(namespace, i=0, ip=conf.osc_ip_max, port=conf.port_max, ):
-    streamer = OSCStreamer(namespace, i)
-    streamer.create_osc_stream(ip, port)
-    streamer.stream_to_osc()
-
+5
+def push_data(namespace, host, port):
+    pusher = AsyncClient(namespace, host, port)
+    asyncio.run(pusher.run())
     
 if __name__ == "__main__":
 
@@ -262,16 +265,9 @@ if __name__ == "__main__":
     th2 = multiprocessing.Process(target=do_processing, args = (namespace,))
     th2.start()
     
-    th3 = multiprocessing.Process(target=do_osc_streaming, args = (namespace,))
+    th3 = multiprocessing.Process(target=push_data, args = (namespace, conf.host_integrator, conf.port_integrator))
     th3.start()
-
-    th4 = multiprocessing.Process(target=do_osc_streaming, args = (namespace, 1, conf.osc_ip_td, conf.port_td))
-    th4.start()
     
     th1.join()
     th2.join()
     th3.join()
-    th4.join()
-
-
-
